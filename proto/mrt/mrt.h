@@ -109,16 +109,39 @@ struct mrt_bgp_data {
   u8 add_path;
 };
 
+struct mrt_ospf_data {
+    uint ospf2; /* true if OSPFv2, false if OSPFv3 */
+    uint extended_timestamp; /* true if we should record microseconds as well (only for OSPFv3) */
+    ip_addr peer_ip;
+    ip_addr local_ip;
+    uint msg_subtype;
+    byte *message;
+    uint msg_len;
+};
 
 #define MRT_HDR_LENGTH		12	/* MRT Timestamp + MRT Type + MRT Subtype + MRT Load Length */
 #define MRT_PEER_TYPE_32BIT_ASN	2	/* MRT Table Dump: Peer Index Table: Peer Type: Use 32bit ASN */
 #define MRT_PEER_TYPE_IPV6	1	/* MRT Table Dump: Peer Index Table: Peer Type: Use IPv6 IP Address */
+#define MRT_MSEC_TIMESTAMP_LEN 4
 
 #define MRT_ATTR_BUFFER_SIZE	65536
 
+/* MRT AFI Types */
+#define MRT_AFI_RESERVED 0
+#define MRT_AFI_IPV4 1
+#define MRT_AFI_IPV6 2
+
 /* MRT Types */
+#define MRT_OSPFV2      11
 #define MRT_TABLE_DUMP_V2 	13
 #define MRT_BGP4MP		16
+#define MRT_BGP4MP_ET   17
+#define MRT_OSPFV3      48
+#define MRT_OSPFV3_ET   49
+
+/* Non-Standard MRT OSPF subtypes */
+#define MRT_OSPF_RX 1
+#define MRT_OSPF_TX 2
 
 /* MRT Table Dump v2 Subtypes */
 #define MRT_PEER_INDEX_TABLE		1
@@ -147,11 +170,14 @@ struct mrt_bgp_data {
 
 #ifdef CONFIG_MRT
 void mrt_dump_cmd(struct mrt_dump_data *d);
-void mrt_dump_bgp_message(struct mrt_bgp_data *d);
+void mrt_dump_bgp_message(struct mrt_bgp_data *d, int is_local);
+void mrt_dump_bgp_message_et(struct mrt_bgp_data *d, int is_local);
+void mrt_dump_ospf_message(struct mrt_ospf_data *d);
 void mrt_dump_bgp_state_change(struct mrt_bgp_data *d);
 void mrt_check_config(struct proto_config *C);
 #else
 static inline void mrt_dump_bgp_message(struct mrt_bgp_data *d UNUSED) { }
+static inline void mrt_dump_bgp_message_et(struct mrt_bgp_data *d UNUSED) { }
 static inline void mrt_dump_bgp_state_change(struct mrt_bgp_data *d UNUSED) { }
 #endif
 

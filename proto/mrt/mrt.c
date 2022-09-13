@@ -169,6 +169,29 @@ mrt_init_message(buffer *b, u16 type, u16 subtype)
   mrt_put_u32_(b, 0);
 }
 
+static void mrt_init_message_et(buffer *b, u16 type, u16 subtype) {
+    btime realtime;
+    btime realtime_ms_off;
+
+    /* Reset buffer */
+    mrt_buffer_flush(b);
+    mrt_buffer_need(b, MRT_HDR_LENGTH + MRT_MSEC_TIMESTAMP_LEN);
+
+    realtime = current_real_time();
+    realtime_ms_off = realtime % 1000000;
+
+    /* Prepare header */
+    mrt_put_u32_(b, realtime TO_S); /* now_real */
+    mrt_put_u16_(b, type);
+    mrt_put_u16_(b, subtype);
+
+    /* Message length, will be fixed later */
+    mrt_put_u32_(b, 0);
+
+    /* set microsecond offset */
+    mrt_put_u32_(b, realtime_ms_off);
+}
+
 static void
 mrt_dump_message(buffer *b, int fd)
 {
@@ -790,8 +813,23 @@ mrt_bgp_header(buffer *b, struct mrt_bgp_data *d)
   }
 }
 
+static void
+mrt_ospf_header(buffer *b, struct mrt_ospf_data *d, int mrt_afi) {
+    if (mrt_afi != MRT_AFI_RESERVED){
+        mrt_put_u16(b, mrt_afi);
+    }
+
+    if (d->ospf2) {
+        mrt_put_ip4(b, ipa_to_ip4(d->peer_ip));
+        mrt_put_ip4(b, ipa_to_ip4(d->local_ip));
+    } else {
+        mrt_put_ip6(b, ipa_to_ip6(d->peer_ip));
+        mrt_put_ip6(b, ipa_to_ip6(d->local_ip));
+    }
+}
+
 void
-mrt_dump_bgp_message(struct mrt_bgp_data *d)
+mrt_dump_bgp_message(struct mrt_bgp_data *d, int is_local)
 {
   const u16 subtypes[] = {
     MRT_BGP4MP_MESSAGE,			MRT_BGP4MP_MESSAGE_AS4,
@@ -801,10 +839,50 @@ mrt_dump_bgp_message(struct mrt_bgp_data *d)
   };
 
   buffer *b = mrt_bgp_buffer();
-  mrt_init_message(b, MRT_BGP4MP, subtypes[d->as4 + 4*d->add_path]);
+  mrt_init_message(b, MRT_BGP4MP, subtypes[((is_local != 0) * 2) + (d->as4 + 4*d->add_path)]);
   mrt_bgp_header(b, d);
   mrt_put_data(b, d->message, d->msg_len);
   mrt_dump_message(b, config->mrtdump_file);
+}
+
+void
+mrt_dump_bgp_message_et(struct mrt_bgp_data *d, int is_local)
+{
+    const u16 subtypes[] = {
+            MRT_BGP4MP_MESSAGE,			MRT_BGP4MP_MESSAGE_AS4,
+            MRT_BGP4MP_MESSAGE_LOCAL,		MRT_BGP4MP_MESSAGE_AS4_LOCAL,
+            MRT_BGP4MP_MESSAGE_ADDPATH,		MRT_BGP4MP_MESSAGE_AS4_ADDPATH,
+            MRT_BGP4MP_MESSAGE_LOCAL_ADDPATH,	MRT_BGP4MP_MESSAGE_AS4_LOCAL_ADDPATH,
+    };
+
+    buffer *b = mrt_bgp_buffer();
+    mrt_init_message_et(b, MRT_BGP4MP_ET, subtypes[((is_local != 0) * 2) + (d->as4 + 4*d->add_path)]);
+    mrt_bgp_header(b, d);
+    mrt_put_data(b, d->message, d->msg_len);
+    mrt_dump_message(b, config->mrtdump_file);
+}
+
+void
+mrt_dump_ospf_message(struct mrt_ospf_data *d) {
+    int mrt_type = MRT_AFI_RESERVED;
+    buffer *b = mrt_bgp_buffer(); /* FIXME name is confusing, I agree */
+
+    if (d->ospf2 && !d->extended_timestamp) {
+        mrt_init_message(b, MRT_OSPFV2, d->msg_subtype);
+    } else if (d->ospf2 && d->extended_timestamp) {
+        mrt_init_message_et(b, MRT_OSPFV3_ET, d->msg_subtype);
+        mrt_type = MRT_AFI_IPV4;
+    } else if (!d->ospf2 && d->extended_timestamp) {
+        mrt_init_message_et(b, MRT_OSPFV3_ET, d->msg_subtype);
+        mrt_type = MRT_AFI_IPV6;
+    } else {
+        mrt_init_message_et(b, MRT_OSPFV3, d->msg_subtype);
+        mrt_type = MRT_AFI_IPV6;
+    }
+
+    mrt_ospf_header(b, d, mrt_type);
+    mrt_put_data(b, d->message, d->msg_len);
+    mrt_dump_message(b, config->mrtdump_file);
 }
 
 void

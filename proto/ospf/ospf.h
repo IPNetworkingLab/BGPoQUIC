@@ -106,7 +106,17 @@ struct ospf_config
   uint ecmp;
   list area_list;		/* list of area configs (struct ospf_area_config) */
   list vlink_list;		/* list of configured vlinks (struct ospf_iface_patt) */
+  const char *tls_cert_path;
+  const char *tls_key_path;
+  const char *tls_secrets_path;
+  const char *tls_remote_sni;
+  const char *tls_root_ca;
+  u8 tls_peer_require_auth;
+  u8 tls_insecure;
+  const char *alpn;
 };
+
+
 
 struct ospf_area_config
 {
@@ -194,8 +204,13 @@ struct ospf_iface_patt
   u8 ptp_address;		/* bool + 2 for unspecified */
   u8 ttl_security;		/* bool + 2 for TX only */
   u8 bfd;
+  const char *tls_sni;
   list *passwords;
+  ip_addr alt_remote_addr; /* alternative address to use  */
+  ip_addr alt_local_addr;  /* for connection migration    */
 };
+
+#define QUIC_OSPF_PORT 4443
 
 /* Default values for interface parameters */
 #define COST_D 10
@@ -252,6 +267,7 @@ struct ospf_proto
   u32 last_vlink_id;		/* Interface IDs for vlinks (starts at 0x80000000) */
   struct tbf log_pkt_tbf;	/* TBF for packet messages */
   struct tbf log_lsa_tbf;	/* TBF for LSA messages */
+  sock *trans_serv_sk;
 };
 
 struct ospf_area
@@ -285,6 +301,10 @@ struct ospf_iface
 
   pool *pool;
   sock *sk;			/* IP socket */
+  sock *trans_cli_sk;
+  sock *ip_sk;
+  sock *stream_sk;
+  sock *con_sk;
   list neigh_list;		/* List of neighbors (struct ospf_neighbor) */
   u32 cost;			/* Cost of iface */
   u32 waitint;			/* Number of seconds before changing state from wait */
@@ -359,6 +379,7 @@ struct ospf_neighbor
   node n;
   pool *pool;
   struct ospf_iface *ifa;
+
   u8 state;
   u8 gr_active;			/* We act as GR helper for the neighbor */
   u8 got_my_rt_lsa;		/* Received my Rt-LSA in DBDES exchanged */
@@ -1019,11 +1040,17 @@ void ospf_iface_new(struct ospf_area *oa, struct ifa *addr, struct ospf_iface_pa
 void ospf_iface_new_vlink(struct ospf_proto *p, struct ospf_iface_patt *ip);
 void ospf_iface_remove(struct ospf_iface *ifa);
 void ospf_iface_shutdown(struct ospf_iface *ifa);
+
 int ospf_iface_assure_bufsize(struct ospf_iface *ifa, uint plen);
 int ospf_iface_reconfigure(struct ospf_iface *ifa, struct ospf_iface_patt *new);
 void ospf_reconfigure_ifaces(struct ospf_proto *p);
 void ospf_open_vlink_sk(struct ospf_proto *p);
 struct nbma_node *find_nbma_node_(list *nnl, ip_addr ip);
+void ospf_open_trans_client_sk(struct ospf_iface *ifa);
+void ospf_stream_reset(struct ospf_iface *ifa);
+void ospf_stream_err_hook(sock *sk, int err);
+void ospf_iface_connected(sock *sk);
+int ospf_stream_rx_hook(sock *sk, uint UNUSED arg);
 
 static inline struct nbma_node * find_nbma_node(struct ospf_iface *ifa, ip_addr ip)
 { return find_nbma_node_(&ifa->nbma_list, ip); }

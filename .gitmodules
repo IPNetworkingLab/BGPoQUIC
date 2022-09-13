@@ -1,0 +1,3 @@
+[submodule "quic_socket_api"]
+	path = quic_socket_api
+	url = https://github.com/IPNetworkingLab/BGPoQUIC_socket_api

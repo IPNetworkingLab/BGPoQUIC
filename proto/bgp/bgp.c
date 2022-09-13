@@ -111,6 +111,8 @@
 #undef LOCAL_DEBUG
 
 #include <stdlib.h>
+#include <stdio.h>
+#include <unistd.h>
 
 #include "nest/bird.h"
 #include "nest/iface.h"
@@ -125,6 +127,7 @@
 #include "lib/string.h"
 
 #include "bgp.h"
+#include "lib/evt_notifier.h"
 
 
 static list STATIC_LIST_INIT(bgp_sockets);		/* Global list of listening sockets */
@@ -138,6 +141,7 @@ static void bgp_send_open(struct bgp_conn *conn);
 static void bgp_update_bfd(struct bgp_proto *p, const struct bfd_options *bfd);
 
 static int bgp_incoming_connection(sock *sk, uint dummy UNUSED);
+static int bgp_incoming_quic_connection(sock *sk, uint dummy UNUSED);
 static void bgp_listen_sock_err(sock *sk UNUSED, int err);
 
 /**
@@ -175,7 +179,13 @@ bgp_open(struct bgp_proto *p)
     }
 
   sock *sk = sk_new(proto_pool);
-  sk->type = SK_TCP_PASSIVE;
+  if (p->cf->conn_type == BGP_CONN_QUIC) {
+    sk_set_tls_config(sk, p->cf->tls_insecure,
+                      p->cf->tls_cert_path, p->cf->tls_key_path,
+                      p->cf->alpn, p->cf->alpn, p->cf->client_require_auth,
+                      p->cf->tls_root_ca, p->cf->remote_sni, NULL);
+  }
+  sk->type = p->cf->conn_type == BGP_CONN_TCP ? SK_TCP_PASSIVE : SK_QUIC_PASSIVE;
   sk->ttl = 255;
   sk->saddr = addr;
   sk->sport = port;
@@ -185,7 +195,11 @@ bgp_open(struct bgp_proto *p)
   sk->tos = IP_PREC_INTERNET_CONTROL;
   sk->rbsize = BGP_RX_BUFFER_SIZE;
   sk->tbsize = BGP_TX_BUFFER_SIZE;
-  sk->rx_hook = bgp_incoming_connection;
+  if (p->cf->conn_type == BGP_CONN_TCP) {
+      sk->rx_hook = bgp_incoming_connection;
+  } else {
+      sk->rx_hook = bgp_incoming_quic_connection;
+  }
   sk->err_hook = bgp_listen_sock_err;
 
   if (sk_open(sk) < 0)
@@ -377,6 +391,10 @@ bgp_close_conn(struct bgp_conn *conn)
   rfree(conn->tx_ev);
   conn->tx_ev = NULL;
   rfree(conn->sk);
+  if (conn->sk_quic_conn) {
+      rfree(conn->sk_quic_conn);
+      conn->sk_quic_conn = NULL;
+  }
   conn->sk = NULL;
 
   mb_free(conn->local_caps);
@@ -585,6 +603,7 @@ bgp_conn_enter_established_state(struct bgp_conn *conn)
 
   /* Summary state of ADD_PATH RX for active channels */
   uint summary_add_path_rx = 0;
+  uint summary_add_path_tx = 0;
 
   WALK_LIST(c, p->p.channels)
   {
@@ -651,8 +670,10 @@ bgp_conn_enter_established_state(struct bgp_conn *conn)
     c->add_path_rx = (loc->add_path & BGP_ADD_PATH_RX) && (rem->add_path & BGP_ADD_PATH_TX);
     c->add_path_tx = (loc->add_path & BGP_ADD_PATH_TX) && (rem->add_path & BGP_ADD_PATH_RX);
 
-    if (active)
+    if (active) {
       summary_add_path_rx |= !c->add_path_rx ? 1 : 2;
+      summary_add_path_tx |= !c->add_path_tx ? 1 : 2;
+    }
 
     /* Update RA mode */
     if (c->add_path_tx)
@@ -667,6 +688,7 @@ bgp_conn_enter_established_state(struct bgp_conn *conn)
   p->channel_map = mb_alloc(p->p.pool, num * sizeof(void *));
   p->channel_count = num;
   p->summary_add_path_rx = summary_add_path_rx;
+  p->summary_add_path_tx = summary_add_path_tx;
 
   WALK_LIST(c, p->p.channels)
   {
@@ -950,8 +972,33 @@ bgp_connected(sock *sk)
   struct bgp_conn *conn = sk->data;
   struct bgp_proto *p = conn->bgp;
 
+  if (QUIC_TYPE(sk)) {
+      bgp_setup_sk(conn, sk);
+  }
+
   BGP_TRACE(D_EVENTS, "Connected");
   bgp_send_open(conn);
+}
+
+static void bgp_quic_connected(sock *sk) {
+    size_t cert_size_len;
+    char tlv_cert[8192 + 3];
+    struct bgp_conn *conn = sk->data;
+
+    if (conn->bgp->p.cf->control_socket) {
+        /* we pass the certificate to the unix socket */
+        cert_size_len = sk_get_remote_tls_certificate(sk, tlv_cert + 3, sizeof(tlv_cert) - 3);
+        if (cert_size_len <= 0) {
+            log(L_ERR "Failed to get remote certificate while QUIC is connected !");
+        } else {
+            tlv_cert[0] = EVT_NOTIF_CERT;
+            put_u16(tlv_cert + 1, cert_size_len);
+            evt_notifier_schedule_packet(conn->bgp->p.cf->control_socket, tlv_cert, cert_size_len + 3);
+        }
+    }
+    /* keep track of connection socket */
+    conn->sk_quic_conn = sk;
+    sk_open_stream(sk, bgp_connected);
 }
 
 static void
@@ -1097,7 +1144,15 @@ bgp_connect(struct bgp_proto *p)	/* Enter Connect state and start establishing c
 
   DBG("BGP: Connecting\n");
   sock *s = sk_new(p->p.pool);
-  s->type = SK_TCP_ACTIVE;
+
+  if (p->cf->conn_type == BGP_CONN_QUIC) {
+      sk_set_tls_config(s, p->cf->tls_insecure,
+                        p->cf->tls_cert_path, p->cf->tls_key_path,
+                        p->cf->alpn, p->cf->tls_keylog_file, p->cf->client_require_auth,
+                        p->cf->tls_root_ca, p->cf->remote_sni, NULL);
+  }
+
+  s->type = p->cf->conn_type == BGP_CONN_TCP ? SK_TCP_ACTIVE : SK_QUIC_ACTIVE;
   s->saddr = p->local_ip;
   s->daddr = p->remote_ip;
   s->dport = p->cf->remote_port;
@@ -1108,7 +1163,11 @@ bgp_connect(struct bgp_proto *p)	/* Enter Connect state and start establishing c
   s->tbsize = p->cf->enable_extended_messages ? BGP_TX_BUFFER_EXT_SIZE : BGP_TX_BUFFER_SIZE;
   s->tos = IP_PREC_INTERNET_CONTROL;
   s->password = p->cf->password;
-  s->tx_hook = bgp_connected;
+  if (p->cf->conn_type == BGP_CONN_TCP) {
+      s->tx_hook = bgp_connected;
+  } else {
+      s->tx_hook = bgp_quic_connected;
+  }
   BGP_TRACE(D_EVENTS, "Connecting to %I%J from local address %I%J",
 	    s->daddr, ipa_is_link_local(s->daddr) ? p->cf->iface : NULL,
 	    s->saddr, ipa_is_link_local(s->saddr) ? s->iface : NULL);
@@ -1136,6 +1195,10 @@ err:
 
 static inline int bgp_is_dynamic(struct bgp_proto *p)
 { return ipa_zero(p->remote_ip); }
+
+static inline int bgp_is_tls_autoconf(struct bgp_proto *p) {
+    return p->cf->tls_auto_conf;
+}
 
 /**
  * bgp_find_proto - find existing proto for incoming connection
@@ -1168,6 +1231,8 @@ bgp_find_proto(sock *sk)
 
   return best;
 }
+
+
 
 /**
  * bgp_incoming_connection - handle an incoming connection
@@ -1245,6 +1310,21 @@ bgp_incoming_connection(sock *sk, uint dummy UNUSED)
     sk_reallocate(sk);
   }
 
+  if (bgp_is_tls_autoconf(p) && p->p.cf->control_socket) {
+    char tlv_data[4096 + 3];
+    size_t pem_cert_len;
+    sock *sk_conn = p->incoming_conn.sk_quic_conn;
+    if ((pem_cert_len = sk_get_remote_tls_certificate(sk_conn, tlv_data+3, sizeof(tlv_data)-3)) <= 0) {
+      BGP_TRACE(D_EVENTS, "Unable to get remote certificate for incoming connection %I%J port %d!",
+                sk->daddr, ipa_is_link_local(sk->daddr) ? sk->iface : NULL, sk->dport);
+    } else {
+        /* to refactor, code is too complicated */
+        tlv_data[0] = EVT_NOTIF_CERT;
+        put_u16(tlv_data+1, pem_cert_len);
+        evt_notifier_schedule_packet(p->p.cf->control_socket, tlv_data, pem_cert_len+3);
+    }
+  }
+
   /* For dynamic BGP, spawn new instance and postpone the socket */
   if (bgp_is_dynamic(p))
   {
@@ -1265,6 +1345,31 @@ err:
   log(L_ERR "%s: Incoming connection aborted", p->p.name);
   rfree(sk);
   return 0;
+}
+
+static int bgp_incoming_quic_connection(sock *sk, uint dummy UNUSED) {
+    struct bgp_proto *p;
+
+    /* the quic connection is established */
+    /* we now wait for the remote stream */
+    if (sk->type != SK_QUIC_PASSIVE_CONNECTED) {
+        bug("Not a passive quic connected socket");
+    }
+
+    DBG("BGP: Incoming QUIC connection from %I port %d\n", sk->daddr, sk->dport);
+    p = bgp_find_proto(sk);
+    if (!p)
+    {
+        log(L_WARN "BGP: Unexpected QUIC connect from unknown address %I%J (port %d)",
+                sk->daddr, ipa_is_link_local(sk->daddr) ? sk->iface : NULL, sk->dport);
+        rfree(sk);
+        return 0;
+    }
+
+    /* keep track of the quic connection in the bgp conn */
+    p->incoming_conn.sk_quic_conn = sk;
+    sk->rx_hook = bgp_incoming_connection;
+    return 0;
 }
 
 static void
@@ -1907,6 +2012,8 @@ void
 bgp_postconfig(struct proto_config *CF)
 {
   struct bgp_config *cf = (void *) CF;
+  char err_msg[1024];
+  int sn_print;
 
   /* Do not check templates at all */
   if (cf->c.class == SYM_TEMPLATE)
@@ -1995,6 +2102,37 @@ bgp_postconfig(struct proto_config *CF)
   if (internal && cf->enforce_first_as)
     cf_error("Enforce first AS check is requires EBGP sessions");
 
+  if (cf->conn_type == BGP_CONN_QUIC) {
+    if (!cf->tls_cert_path)
+      cf_error("TLS Certificate path must be set when transport quic is set!");
+    if (!cf->tls_key_path)
+      cf_error("TLS Key path must be set when transport quic is set!");
+
+    if (access(cf->tls_cert_path, R_OK) != 0) {
+      sn_print = snprintf(err_msg, sizeof(err_msg), "%s: %s", cf->tls_cert_path, strerror(errno));
+      if (sn_print == sizeof(err_msg)) {
+        cf_error("BGP post config Internal Error. Anyway, these is a problem with the TLS Certificate path!");
+      }
+      cf_error(err_msg);
+    }
+
+    if (access(cf->tls_key_path, R_OK) != 0) {
+      sn_print = snprintf(err_msg, sizeof(err_msg), "%s: %s", cf->tls_key_path, strerror(errno));
+      if (sn_print == sizeof(err_msg)) {
+        cf_error("BGP post config Internal Error. Anyway, this is a problem with the TLS Key path");
+      }
+      cf_error(err_msg);
+    }
+  } else if (cf->conn_type == BGP_CONN_TCP) {
+      if (cf->tls_cert_path) {
+          cf_error("\"transport quic\" must be explicitly when certificate is set");
+      }
+      if (cf->tls_key_path) {
+          cf_error("\"transport quic\" must be explicitly when key is set");
+      }
+  } else {
+      cf_error("transport type not recognized !");
+  }
 
   struct bgp_channel_config *cc;
   WALK_LIST(cc, CF->channels)

@@ -144,10 +144,49 @@ ospf_neigh_chstate(struct ospf_neighbor *n, u8 state)
   if (state == old_state)
     return;
 
+  if (state == NEIGHBOR_EXSTART && !ifa->stream_sk) return;
+
   OSPF_TRACE(D_EVENTS, "Neighbor %R on %s changed state from %s to %s",
 	     n->rid, ifa->ifname, ospf_ns_names[old_state], ospf_ns_names[state]);
 
   n->state = state;
+
+  if (state == NEIGHBOR_2WAY) {
+      /* Create transport tunnel before beginning talking with our neighbor */
+      if (p->router_id < n->rid) {
+
+	log(L_INFO "we are the client");
+
+	/* We are the client, we initiate a connection with our neighbor. */
+	log(L_INFO "Opening a transport connection with our neighbor.");
+
+	struct ospf_iface *ifa = n->ifa;
+	sock *tsk = ifa->trans_cli_sk;
+	tsk->daddr = n->ip;
+	tsk->dport = p->trans_serv_sk->sport;
+	tsk->data = (void*) n;
+
+	if (sk_open(tsk) < 0) {
+	    log(L_ERR "Failed to open the transport connection");
+	    // TODO error handling
+	}
+
+      } else if (p->router_id > n->rid) {
+	/* We are the server, we enter a transient state were we don't use the IP socket anymore
+	 * but the stream socket is not ready yet.
+	 */
+	log(L_INFO "we are the server");
+	/* If the stream has already been created by the client, we start the LSDB exchange */
+      } else {
+	/* should not happen */
+      }
+  }
+
+  /* When we loose our neighbor, we cleanup the stream socket and fallback on the IP sk */
+  if (state == NEIGHBOR_DOWN && ifa->stream_sk == ifa->sk) {
+      log("We lost our neighbor: fallback on IP sk");
+      ospf_stream_reset(ifa);
+  }
 
   /* Increase number of partial adjacencies */
   if ((state == NEIGHBOR_EXCHANGE) || (state == NEIGHBOR_LOADING))
@@ -198,6 +237,133 @@ ospf_neigh_chstate(struct ospf_neighbor *n, u8 state)
     ospf_iface_sm(ifa, ISM_NEICH);
   if ((state < NEIGHBOR_2WAY) && (old_state >= NEIGHBOR_2WAY) && !n->gr_active)
     ospf_iface_sm(ifa, ISM_NEICH);
+}
+
+int ospf_stream_rx_hook(sock *sk, uint UNUSED arg) {
+
+    log("Got a new stream on srv transport sk");
+    struct ospf_iface *ifa = (struct ospf_iface*) sk->data;
+    if (!ifa->stream_sk) {
+	struct ospf_neighbor *n;
+	WALK_LIST(n, ifa->neigh_list) {
+	    log("%i %i", n->rid, n->state);
+	    if (n->state <= NEIGHBOR_2WAY) {
+		sk->data = (void*) ifa;
+		break;
+	    }
+	    sk->data = NULL;
+	}
+	if (!sk->data) bug("Did not found the neighbor");
+	ifa->stream_sk = sk;
+	ifa->stream_sk->rx_hook = ospf_rx_hook;
+	ifa->stream_sk->err_hook = ospf_stream_err_hook;
+	ifa->sk = ifa->stream_sk;
+	ospf_neigh_chstate(n, NEIGHBOR_EXSTART);
+    } else 
+	log(L_WARN "Unexpected transport stream connection");
+
+    return 1;
+}
+
+void
+ospf_stream_reset(struct ospf_iface *ifa) {
+  log(L_WARN "Stream reset");
+  /* Fallback on IP socket to be able to reply to HELLOs */
+  ifa->sk = ifa->ip_sk;
+
+  if (ifa->stream_sk) {
+    sk_close_transport(ifa->stream_sk);
+    ifa->stream_sk = NULL;
+  }
+  /*if (ifa->con_sk) {
+    sk_close_transport(ifa->con_sk);
+    ifa->con_sk = NULL;
+  }*/
+
+  /* If we are client-side, we re-create the client socket as the previous one is not usable
+   * anymore. This is not required server-side since this socket is not used.
+   */
+  if (ifa->trans_cli_sk->type == SK_QUIC_ACTIVE_CONNECTED)
+    ospf_open_trans_client_sk(ifa);
+}
+
+void
+ospf_stream_err_hook(sock *sk, int err UNUSED)
+{
+  struct ospf_iface *ifa = (struct ospf_iface*) sk->data;
+  //struct ospf_proto *p = ifa->oa->po;
+
+  //log(L_ERR "%s : %s: Transport stream socket error: %M", p->p.name, ifa->ifname, err);
+  log(L_ERR "Transport stream socket error: %i");
+
+  /* TODO Without more indication on the error type, we consider that the stream is down */
+  //ospf_stream_reset(ifa);
+  struct ospf_neighbor *n;
+  WALK_LIST(n, ifa->neigh_list) {
+      if (n->state >= NEIGHBOR_EXCHANGE) {
+	  ospf_neigh_chstate(n, NEIGHBOR_DOWN);
+	  break;
+      }
+  }
+}
+
+/**
+ * ospf_stream_connected - called client-side when a stream is up
+ * @sk: The stream socket
+ *
+ * Currently, we use a single stream in OSPF but in the future we could add more of them.
+ */
+static void 
+ospf_stream_connected(sock *sk) {
+    log(L_INFO "Stream connected");
+    
+    struct ospf_neighbor *n = (struct ospf_neighbor*) sk->data;
+    struct ospf_iface *ifa = n->ifa;
+    sock *stream_sk = ifa->stream_sk;
+
+    if (!stream_sk) {
+	log(L_INFO "Transport stream created with neighbor.");
+	ifa->stream_sk = sk;
+	ifa->sk = ifa->stream_sk;
+	sk->rx_hook = ospf_rx_hook;		// Classical OSPF msg callback
+	sk->err_hook = ospf_stream_err_hook;
+	sk->data = (void*) ifa;
+
+        /* We are ready to talk with our neighbor */
+        ospf_neigh_chstate(n, NEIGHBOR_EXSTART);
+    } else {
+	// TODO handle multistream setup
+	log(L_WARN "Unexpected stream connected");
+    }
+}
+
+/**
+ * ospf_iface_connected - called client-side when a connection we initiated is correctly opened.
+ * @sk: The connection socket
+ *
+ * Currently, we create a single stream with our peer but in the future we could use more streams.
+ */
+void
+ospf_iface_connected(sock *sk) {
+    struct ospf_neighbor *neigh;
+    struct ospf_iface *ifa;
+    struct ospf_iface_patt *ifa_pat;
+    log(L_INFO "Transport connected to neighbor.");
+    log(L_INFO "Opening a HELLO stream with our neighbor");
+
+    neigh = sk->data;
+    ifa = neigh->ifa;
+    ifa_pat = ifa->cf;
+    /* set fallback address here (if any) */
+    if (ipa_nonzero(ifa_pat->alt_remote_addr) && ipa_nonzero(ifa_pat->alt_local_addr)) {
+        log(L_INFO "Setting alternative address for QUIC transport");
+        sk_set_fallback_address(sk, &ifa_pat->alt_local_addr, &ifa_pat->alt_remote_addr,
+                                0, QUIC_OSPF_PORT);
+    }
+
+    /* Create stream to pipe OSPF msgs in */
+    if (sk_open_stream(sk, ospf_stream_connected) < 0)
+	log(L_ERR "Failed to open a stream.");
 }
 
 /**

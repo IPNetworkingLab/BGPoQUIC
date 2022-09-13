@@ -1,4 +1,4 @@
-/*
+/*/*
  *	BIRD -- OSPF
  *
  *	(c) 1999--2004 Ondrej Filip <feela@network.cz>
@@ -212,6 +212,7 @@ ospf_do_send_dbdes(struct ospf_proto *p, struct ospf_neighbor *n)
 void
 ospf_send_dbdes(struct ospf_proto *p, struct ospf_neighbor *n)
 {
+
   /* RFC 2328 10.8 */
 
   ASSERT((n->state == NEIGHBOR_EXSTART) || (n->state == NEIGHBOR_EXCHANGE));

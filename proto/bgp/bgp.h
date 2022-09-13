@@ -134,6 +134,17 @@ struct bgp_config {
   int dynamic_name_digits;		/* Minimum number of digits for dynamic names */
   int check_link;			/* Use iface link state for liveness detection */
   struct bfd_options *bfd;		/* Use BFD for liveness detection */
+
+  int conn_type;
+  int tls_insecure;
+  const char *tls_root_ca;
+  const char *tls_cert_path;
+  const char *tls_key_path;
+  const char *alpn;
+  const char *remote_sni;
+  const char *tls_keylog_file;
+  int client_require_auth; /* the remote peer must provide a TLS certificate */
+  int tls_auto_conf;
 };
 
 struct bgp_channel_config {
@@ -274,6 +285,7 @@ struct bgp_stats {
 struct bgp_conn {
   struct bgp_proto *bgp;
   struct birdsock *sk;
+  struct birdsock *sk_quic_conn;
   u8 state;				/* State of connection state machine */
   u8 as4_session;			/* Session uses 4B AS numbers in AS_PATH (both sides support it) */
   u8 ext_messages;			/* Session uses extended message length */
@@ -319,6 +331,7 @@ struct bgp_proto {
   u8 gr_active_num;			/* Neighbor is doing GR, number of active channels */
   u8 channel_count;			/* Number of active channels */
   u8 summary_add_path_rx;		/* Summary state of ADD_PATH RX w.r.t active channels */
+  u8 summary_add_path_tx;		/* Summary state of ADD_PATH TX w.r.t active channels */
   u32 *afi_map;				/* Map channel index -> AFI */
   struct bgp_channel **channel_map;	/* Map channel index -> channel */
   struct bgp_conn *conn;		/* Connection we have established */
@@ -484,6 +497,11 @@ struct bgp_parse_state {
 #define BGP_TX_BUFFER_SIZE	4096
 #define BGP_RX_BUFFER_EXT_SIZE	65535
 #define BGP_TX_BUFFER_EXT_SIZE	65535
+
+enum {
+    BGP_CONN_TCP,
+    BGP_CONN_QUIC,
+};
 
 static inline int bgp_channel_is_ipv4(struct bgp_channel *c)
 { return BGP_AFI(c->afi) == BGP_AFI_IPV4; }

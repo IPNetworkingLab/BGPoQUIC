@@ -32,7 +32,9 @@ CF_KEYWORDS(BGP, LOCAL, NEIGHBOR, AS, HOLD, TIME, CONNECT, RETRY, KEEPALIVE,
 	LIVED, STALE, IMPORT, IBGP, EBGP, MANDATORY, INTERNAL, EXTERNAL, SETS,
 	DYNAMIC, RANGE, NAME, DIGITS, BGP_AIGP, AIGP, ORIGINATE, COST, ENFORCE,
 	FIRST, FREE, VALIDATE, BASE, ROLE, ROLES, PEER, PROVIDER, CUSTOMER,
-	RS_SERVER, RS_CLIENT, REQUIRE, BGP_OTC)
+	RS_SERVER, RS_CLIENT, REQUIRE, BGP_OTC, TRANSPORT, CERTIFICATE, KEY, QUIC,
+	TCP, ALPN, TLS_INSECURE, TLSKEYLOGFILE, PEER_REQUIRE_AUTH, PEER_SET_MY_CONFIG,
+	ROOT, CA, REMOTE, SNI)
 
 %type <i> bgp_nh
 %type <i32> bgp_afi
@@ -76,6 +78,16 @@ bgp_proto_start: proto_start BGP {
      BGP_CFG->local_role = BGP_ROLE_UNDEFINED;
      BGP_CFG->dynamic_name = "dynbgp";
      BGP_CFG->check_link = -1;
+     BGP_CFG->conn_type = BGP_CONN_TCP;
+     BGP_CFG->tls_insecure = 0;
+     BGP_CFG->tls_cert_path = NULL;
+     BGP_CFG->tls_key_path = NULL;
+     BGP_CFG->alpn = "qbgp";
+     BGP_CFG->tls_keylog_file = NULL;
+     BGP_CFG->client_require_auth = 0; /* don't require auth */
+     BGP_CFG->tls_auto_conf = 0;
+     BGP_CFG->tls_root_ca = NULL;
+     BGP_CFG->remote_sni = NULL;
    }
  ;
 
@@ -209,6 +221,21 @@ bgp_proto:
  | bgp_proto ENFORCE FIRST AS bool ';' { BGP_CFG->enforce_first_as = $5; }
  | bgp_proto LOCAL ROLE bgp_role_name ';' { BGP_CFG->local_role = $4; }
  | bgp_proto REQUIRE ROLES bool ';' { BGP_CFG->require_roles = $4; }
+ | bgp_proto TRANSPORT bgp_transport_type ';'
+ | bgp_proto CERTIFICATE TEXT ';' { BGP_CFG->tls_cert_path = $3; }
+ | bgp_proto ROOT CA TEXT ';' { BGP_CFG->tls_root_ca = $4; }
+ | bgp_proto TLS_INSECURE bool ';' { BGP_CFG->tls_insecure = $3; }
+ | bgp_proto KEY TEXT ';' { BGP_CFG->tls_key_path = $3; }
+ | bgp_proto ALPN TEXT ';' { BGP_CFG->alpn = $3; if (strnlen($3, 16) > 15) cf_error("ALPN must be at most 15 characters");}
+ | bgp_proto REMOTE SNI TEXT ';' { BGP_CFG->remote_sni = $4; }
+ | bgp_proto TLSKEYLOGFILE TEXT ';' { BGP_CFG->tls_keylog_file = $3; }
+ | bgp_proto PEER_REQUIRE_AUTH bool ';' { BGP_CFG->client_require_auth = $3; }
+ | bgp_proto PEER_SET_MY_CONFIG bool ';' { BGP_CFG->tls_auto_conf = $3; }
+ ;
+
+bgp_transport_type:
+   QUIC { BGP_CFG->conn_type = BGP_CONN_QUIC; }
+ | TCP  { BGP_CFG->conn_type = BGP_CONN_TCP; }
  ;
 
 bgp_afi:

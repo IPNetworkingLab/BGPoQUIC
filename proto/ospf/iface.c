@@ -112,11 +112,36 @@ find_nbma_node_(list *nnl, ip_addr ip)
   return NULL;
 }
 
+void
+ospf_open_trans_client_sk(struct ospf_iface *ifa) {
+  log("Create client transport socket.");
+
+  struct ospf_proto *p = ifa->oa->po;
+  struct ospf_config *c = (struct ospf_config *) p->p.cf;
+
+  /* Create the client-side transport socket */
+  sock *sk = sk_new(ifa->pool);
+  sk->type = SK_QUIC_ACTIVE;
+  sk_set_tls_config(sk, c->tls_insecure, c->tls_cert_path, c->tls_key_path, c->alpn,
+                    c->tls_secrets_path, c->tls_peer_require_auth, c->tls_root_ca,
+                    ifa->cf->tls_sni, NULL);
+  sk->saddr = ifa->addr->ip;
+  sk->rbsize = sk->tbsize = ifa_bufsize(ifa);
+  sk->iface = ifa->iface;
+  sk->laddr = ifa->addr->ip;
+  sk->data = NULL; /* will be set when OSPF opens the QUIC conn */ // (void *) ifa;
+  sk->tx_hook = ospf_iface_connected;
+  ifa->trans_cli_sk = sk;
+}
 
 static int
 ospf_sk_open(struct ospf_iface *ifa)
 {
   struct ospf_proto *p = ifa->oa->po;
+
+  /* Create the client-side transport socket */
+  ospf_open_trans_client_sk(ifa);
+  ifa->con_sk = NULL;
 
   sock *sk = sk_new(ifa->pool);
   sk->type = SK_IP;
@@ -167,7 +192,8 @@ ospf_sk_open(struct ospf_iface *ifa)
     }
   }
 
-  ifa->sk = sk;
+  ifa->ip_sk = sk;
+  ifa->sk = ifa->ip_sk;
   ifa->sk_dr = 0;
   return 1;
 
@@ -338,6 +364,14 @@ ospf_iface_chstate(struct ospf_iface *ifa, u8 state)
 
   if (state == oldstate)
     return;
+
+  if (oldstate == OSPF_IS_PTP && (state == OSPF_IS_LOOP || state == OSPF_IS_DOWN) &&
+      /* this is ugly hack to check if conn migration is set */
+      ipa_nonzero(ifa->cf->alt_remote_addr)) {
+        OSPF_TRACE(D_EVENTS, "Interface %s: Remote end disconnected. Now %s."
+                             "Connection migration enabled. Don't change state !", ifa->ifname, ospf_is_names[state]);
+        return;
+    }
 
   OSPF_TRACE(D_EVENTS, "Interface %s changed state from %s to %s",
 	     ifa->ifname, ospf_is_names[oldstate], ospf_is_names[state]);
@@ -1197,9 +1231,16 @@ ospf_ifa_notify3(struct proto *P, uint flags, struct ifa *a)
     if (flags & IF_CHANGE_DOWN)
     {
       struct ospf_iface *ifa, *ifx;
-      WALK_LIST_DELSAFE(ifa, ifx, p->iface_list)
-	if ((ifa->addr == a) && (ifa->type != OSPF_IT_VLINK))
-	  ospf_iface_remove(ifa);
+      WALK_LIST_DELSAFE(ifa, ifx, p->iface_list) {
+          if ((ifa->addr == a) && (ifa->type != OSPF_IT_VLINK)) {
+              if (ipa_nonzero(ifa->cf->alt_remote_addr) && ipa_nonzero(ifa->cf->alt_local_addr)) {
+                  OSPF_TRACE(D_EVENTS, "Interface %s has conn migration enabled. "
+                                       "Ignoring Down event", ifa->ifname);
+              } else {
+                  ospf_iface_remove(ifa);
+              }
+          }
+      }
     }
   }
   else
@@ -1352,6 +1393,10 @@ ospf_iface_notify(struct ospf_proto *p, uint flags, struct ospf_iface *ifa)
 
   if (flags & IF_CHANGE_DOWN)
   {
+    if (ipa_nonzero(ifa->cf->alt_remote_addr)) {
+        OSPF_TRACE(D_EVENTS, "iface_notify down but conn migr enabled. Don't remove interface");
+        return;
+    }
     ospf_iface_remove(ifa);
     return;
   }

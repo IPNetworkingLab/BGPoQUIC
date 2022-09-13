@@ -273,6 +273,27 @@ ospf_cleanup_gr_recovery(struct ospf_proto *p)
   p->gr_cleanup = 0;
 }
 
+int ospf_sk_trans_rx_hook(sock *sk, uint UNUSED arg) {
+    log("Got a connection on srv transport sk");
+    struct ospf_proto *p = (struct ospf_proto*) sk->data;
+    struct ospf_iface *iface;
+    WALK_LIST(iface, p->iface_list) {
+	if (iface->iface->index == sk->iface->index) {
+	    sk->data = (void*) iface;
+	    break;
+	}
+	sk->data = NULL;
+    }
+
+    if (!sk->data) bug("Expected interface not found.");
+
+    sk->rx_hook = ospf_stream_rx_hook;
+    iface->con_sk = sk;
+    iface->sk = iface->con_sk;
+    sk->laddr = sk->saddr;
+    return 1;
+}
+
 static int
 ospf_start(struct proto *P)
 {
@@ -328,6 +349,22 @@ ospf_start(struct proto *P)
   struct ospf_iface_patt *ic;
   WALK_LIST(ic, c->vlink_list)
     ospf_iface_new_vlink(p, ic);
+
+  /* Create the server-side transport socket */
+  sock *srv_sk = sk_new(P->pool);
+  sk_set_tls_config(srv_sk, c->tls_insecure, c->tls_cert_path, c->tls_key_path,
+                    c->alpn, c->tls_secrets_path, c->tls_peer_require_auth,
+                    c->tls_root_ca, c->tls_remote_sni, NULL);
+  srv_sk->type = SK_QUIC_PASSIVE;
+  srv_sk->sport = QUIC_OSPF_PORT;
+  srv_sk->rbsize = srv_sk->tbsize = 2048;
+  srv_sk->rx_hook = ospf_sk_trans_rx_hook;
+  srv_sk->data = (void*) p;
+  p->trans_serv_sk = srv_sk;
+
+  /* Transport server is launched */ 
+  if (sk_open(srv_sk) < 0)
+      return PS_DOWN;
 
   return PS_UP;
 }

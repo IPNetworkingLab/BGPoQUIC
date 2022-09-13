@@ -13,6 +13,7 @@
 #include "lib/md5.h"
 #include "lib/mac.h"
 #include "lib/socket.h"
+#include "proto/mrt/mrt.h"
 
 const char * const ospf_pkt_names[] = {
   [HELLO_P]	= "HELLO",
@@ -38,6 +39,34 @@ ospf_pkt_fill_hdr(struct ospf_iface *ifa, void *buf, u8 h_type)
   pkt->checksum = 0;
   pkt->instance_id = ifa->instance_id;
   pkt->autype = ospf_is_v2(p) ? ifa->autype : 0;
+}
+
+static void ospf_dump_message(struct ospf_proto *p, sock *sk,
+                              byte *pkt, uint len, int extended_timestamp,
+                              int ospf_subtype, ip_addr *dst) {
+    struct mrt_ospf_data d;
+    d.ospf2 = ospf_is_v2(p);
+    d.extended_timestamp = extended_timestamp;
+
+    /* get IPs */
+    switch (ospf_subtype) {
+        case MRT_OSPF_RX:
+            d.peer_ip = sk->faddr;
+            d.local_ip = sk->laddr;
+            break;
+        case MRT_OSPF_TX:
+            d.peer_ip = *dst;
+            d.local_ip = sk->saddr;
+            break;
+        default:
+            log(L_WARN "OSPF: mrt dump: unknown subtype %d", ospf_subtype);
+            return;
+    }
+    d.msg_subtype = ospf_subtype;
+    d.message = pkt;
+    d.msg_len = len;
+
+    mrt_dump_ospf_message(&d);
 }
 
 /* We assume OSPFv2 in ospf_pkt_finalize() */
@@ -384,10 +413,16 @@ drop:
 int
 ospf_rx_hook(sock *sk, uint len)
 {
+
+  log("ospf_rx_hook %i %i", sk->lifindex, sk->iface->index);
   /* We want just packets from sk->iface. Unfortunately, on BSD we cannot filter
      out other packets at kernel level and we receive all packets on all sockets */
   if (sk->lifindex != sk->iface->index)
     return 1;
+
+
+  log("check0: OSPF: RX hook called (iface %s, src %I, dst %I)",
+      sk->iface->name, sk->faddr, sk->laddr);
 
   DBG("OSPF: RX hook called (iface %s, src %I, dst %I)\n",
       sk->iface->name, sk->faddr, sk->laddr);
@@ -401,6 +436,8 @@ ospf_rx_hook(sock *sk, uint len)
   /* Should not happen */
   if (ifa->state <= OSPF_IS_LOOP)
     return 1;
+
+  log("check1: %i", ifa->state);
 
   int src_local, dst_local, dst_mcast;
   src_local = ospf_ipa_local(sk->faddr, ifa->addr);
@@ -434,6 +471,8 @@ ospf_rx_hook(sock *sk, uint len)
       LOG_PKT_WARN("Multicast packet received from non-link-local %I via %s",
 		   sk->faddr, ifa->ifname);
   }
+
+  log("check2");
 
   /* Second, we check packet length, checksum, and the protocol version */
   struct ospf_packet *pkt = (void *) sk_rx_buffer(sk, &len);
@@ -591,6 +630,10 @@ found:
        !ospf_pkt_checkauth3(n, ifa, pkt, len, sk->faddr)))
     return 1;
 
+  /* we can now dump ospf packet to MRT */
+  if (p->p.mrtdump & MD_MESSAGES)
+    ospf_dump_message(p, sk, (byte *) pkt, len, p->p.mrtdump_et, MRT_OSPF_RX, NULL);
+
   switch (pkt->type)
   {
   case HELLO_P:
@@ -650,14 +693,28 @@ ospf_verr_hook(sock *sk, int err)
 void
 ospf_send_to(struct ospf_iface *ifa, ip_addr dst)
 {
+  struct ospf_proto *ospf_proto;
   sock *sk = ifa->sk;
+
+  if (QUIC_TYPE(sk) && (ifa->sk != ifa->stream_sk)) {
+    log(L_INFO "send: kept on plain IP");
+    sk = ifa->ip_sk;
+  }
+
   struct ospf_packet *pkt = (struct ospf_packet *) sk->tbuf;
   uint plen = ntohs(pkt->length);
+  ospf_proto = ifa->oa->po;
 
-  if (ospf_is_v2(ifa->oa->po))
+  if (ospf_is_v2(ospf_proto))
     ospf_pkt_finalize2(ifa, pkt, &plen);
   else
     ospf_pkt_finalize3(ifa, pkt, &plen, sk->saddr);
+
+  /* non standard MRT dump */
+  if (ospf_proto->p.mrtdump & MD_MESSAGES) {
+      ospf_dump_message(ospf_proto, sk, (byte *)pkt, plen,
+                        ospf_proto->p.mrtdump_et, MRT_OSPF_TX, &dst);
+  }
 
   int done = sk_send_to(sk, plen, dst, 0);
   if (!done)
